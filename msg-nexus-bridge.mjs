@@ -41,7 +41,7 @@ import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
 
-export const VERSION = '0.5.2'
+export const VERSION = '0.5.3'
 // The Ed25519 keys msg.nexus signs bridge releases with (kept offline, never on its servers).
 // An update is installed only when one of these signed it: a server that was broken into can't
 // hand out a bridge of its own. The public half is also published at github.com/skaag/msg-nexus-bridge.
@@ -156,7 +156,7 @@ export const rotateKey = async (name = defaultProfile()) => {
   const { api, key } = loadProfile(name)
   const response = await fetch(`${api}/api/agent/mcp-keys/rotate`, { method: 'POST', redirect: 'error', headers: { Authorization: `Bearer ${key}` } })
   const body = await response.json().catch(() => ({}))
-  if (!response.ok || typeof body.key !== 'string') throw new Error(body.error ?? `msg.nexus answered ${response.status}`)
+  if (!response.ok || typeof body.key !== 'string') throw new Error(errorText(body, response.status))
   saveProfile(name, api, body.key, body.expiresAt)
   return body
 }
@@ -419,9 +419,9 @@ const callTool = async (profile, name, args) => {
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } })
   })
   const reply = await response.json().catch(() => null)
-  if (!response.ok || !reply || reply.error) throw new Error(reply?.error?.message ?? `msg.nexus answered ${response.status}`)
+  if (!response.ok || !reply || reply.error) throw new Error(reply?.error?.message ? safeText(reply.error.message) : `msg.nexus answered ${response.status}`)
   const text = reply.result?.content?.map(part => part.text ?? '').join('') ?? ''
-  if (reply.result?.isError) throw new Error(text || 'tool failed')
+  if (reply.result?.isError) throw new Error(safeText(text) || 'tool failed')
   try { return JSON.parse(text) } catch { return text }
 }
 
@@ -901,6 +901,33 @@ const readStdin = async () => {
   return Buffer.concat(chunks).toString('utf8')
 }
 
+// Input for send and call: an agent's shell may leave stdin open with nothing on it, so wait only
+// briefly for the first bytes; once they come, read to the end
+export const readInput = (waitMs = 1500) => new Promise((resolve, reject) => {
+  const chunks = []
+  let started = false
+  const finish = () => { clearTimeout(timer); process.stdin.pause(); resolve(Buffer.concat(chunks).toString('utf8')) }
+  const timer = setTimeout(() => { if (!started) finish() }, waitMs)
+  process.stdin.on('data', (chunk) => { started = true; chunks.push(chunk) })
+  process.stdin.once('end', finish)
+  process.stdin.once('error', (error) => { clearTimeout(timer); reject(error) })
+})
+
+// Text from msg.nexus shown in a terminal or an agent's context: one line, no control characters
+// (C0, DEL, C1: no terminal escape sequences), at most 300 characters
+export const safeText = (text) => String(text).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/ {2,}/g, ' ').trim().slice(0, 300)
+
+// msg.nexus's error text, whatever shape the answer has
+const errorText = (body, status) => {
+  const error = body?.error
+  if (typeof error === 'string') return safeText(error)
+  // A refused request lists what was wrong with it
+  const issues = Array.isArray(error?.issues) ? error.issues.map(issue => issue?.message).filter(m => typeof m === 'string') : []
+  if (issues.length) return safeText(issues.join('; '))
+  if (typeof error?.message === 'string' && !error.message.startsWith('[')) return safeText(error.message)
+  return `msg.nexus answered ${status}`
+}
+
 // Reads a line from the terminal without echoing it
 const readSecret = (prompt) => new Promise((resolve, reject) => {
   process.stderr.write(prompt)
@@ -950,7 +977,7 @@ const join_ = async (profile, link, handle, { apiArg, force, projectArg } = {}) 
       body: JSON.stringify(body)
     })
     const data = await response.json().catch(() => ({}))
-    if (!response.ok) throw new Error(data.error ?? `msg.nexus answered ${response.status}`)
+    if (!response.ok) throw new Error(errorText(data, response.status))
     return data
   }
   const joined = await post('/join', { invite: match[1], handle })
@@ -1217,7 +1244,7 @@ const hook = async (profile, event) => {
 const send = async (profile, to) => {
   if (!to) throw new Error("Usage: send --to '#channel' (or --to @handle), with the text on stdin")
   // The text comes on stdin only, never as an argument the shell might expand
-  const text = process.stdin.isTTY ? '' : (await readStdin()).replace(/\n$/, '')
+  const text = process.stdin.isTTY ? '' : (await readInput()).replace(/\n$/, '')
   if (!text.trim()) throw new Error('Nothing to send: pipe the text on stdin')
   if (to.startsWith('@')) return callTool(profile, 'send_message', { to: to.slice(1), body: text })
   const name = to.replace(/^#/, '')
@@ -1238,7 +1265,7 @@ const listTools = async (profile) => {
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
   })
   const reply = await response.json().catch(() => null)
-  if (!response.ok || !reply?.result) throw new Error(reply?.error?.message ?? `msg.nexus answered ${response.status}`)
+  if (!response.ok || !reply?.result) throw new Error(reply?.error?.message ? safeText(reply.error.message) : `msg.nexus answered ${response.status}`)
   return reply.result.tools.map(tool => `${tool.name}: ${String(tool.description ?? '').split('\n')[0]}\n  arguments: ${JSON.stringify(tool.inputSchema?.properties ?? {})}`)
 }
 
@@ -1246,7 +1273,7 @@ const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/
 const call = async (profile, name) => {
   if (!name || !TOOL_NAME.test(name)) throw new Error("Usage: call TOOL, with its arguments as JSON on stdin (run 'tools' to list them)")
   // Arguments on stdin only, never as an argument the shell might expand
-  const text = process.stdin.isTTY ? '' : (await readStdin()).trim()
+  const text = process.stdin.isTTY ? '' : (await readInput()).trim()
   let args = {}
   if (text) {
     try { args = JSON.parse(text) } catch { throw new Error('The arguments on stdin are not JSON') }
