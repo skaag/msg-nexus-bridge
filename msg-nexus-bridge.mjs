@@ -41,11 +41,11 @@ import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
 
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.2'
 // The Ed25519 keys msg.nexus signs bridge releases with (kept offline, never on its servers).
 // An update is installed only when one of these signed it: a server that was broken into can't
 // hand out a bridge of its own. The public half is also published at github.com/skaag/msg-nexus-bridge.
-export const SIGNING_KEYS = ['5r5/FwtxVglqYjNoNEcfaSajXdWK6hRejHRWWzpHo5w=']
+export const SIGNING_KEYS = Object.freeze(['5r5/FwtxVglqYjNoNEcfaSajXdWK6hRejHRWWzpHo5w='])
 const HOME = homedir()
 const env = process.env
 const CONFIG_DIR = env.MSG_NEXUS_CONFIG_DIR ?? join(env.XDG_CONFIG_HOME ?? join(HOME, '.config'), 'msg-nexus')
@@ -177,6 +177,46 @@ const rotateIfDue = async (name) => {
 // ---- projects --------------------------------------------------------------------------------
 // An agent belongs to the project folder it joined from. Sessions in other folders on the same
 // machine get no messages and no key, so an unrelated agent never sees the workspace.
+// Another process's working folder (macOS: lsof; Linux: /proc), or null
+const cwdOf = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  try { return realpathSync.native(`/proc/${pid}/cwd`) } catch {}
+  const out = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 2000 })
+  return /^n(\/.*)$/m.exec(out.stdout ?? '')?.[1] ?? null
+}
+const parentOf = (pid) => {
+  if (pid === process.pid) return process.ppid
+  // Linux: the 4th field of /proc/<pid>/stat (after the name in parentheses)
+  try { return Number.parseInt(readFileSync(`/proc/${pid}/stat`, 'utf8').replace(/^.*\) /s, '').split(' ')[1], 10) || null } catch {}
+  const out = spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 })
+  return Number.parseInt(String(out.stdout).trim(), 10) || null
+}
+const commandOf = (pid) => {
+  try { return readFileSync(`/proc/${pid}/comm`, 'utf8').trim() } catch {}
+  return String(spawnSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 }).stdout ?? '').trim()
+}
+// Claude Code runs a plugin's MCP header helper from the plugin's own folder and doesn't say which
+// project the session is in. Only for that helper, run exactly there: the session is the nearest
+// parent process that is Claude Code itself, and its working folder is the project.
+const isClaude = (command) => {
+  const name = basename(command)
+  return name === 'claude' || (Boolean(env.CLAUDE_CODE_EXECPATH) && command === env.CLAUDE_CODE_EXECPATH)
+}
+const helperSessionFolder = () => {
+  if (!env.CLAUDE_PLUGIN_ROOT) return null
+  try {
+    const root = realpathSync.native(env.CLAUDE_PLUGIN_ROOT)
+    if (realpathSync.native(process.cwd()) !== root) return null
+    if (readJson(join(root, '.claude-plugin', 'plugin.json'), null)?.name !== 'msg-nexus') return null
+  } catch { return null }
+  let pid = process.pid
+  for (let i = 0; i < 4 && pid; i++) {
+    pid = parentOf(pid)
+    if (!pid || pid <= 1) return null
+    if (isClaude(commandOf(pid))) return cwdOf(pid)
+  }
+  return null
+}
 export const currentProject = (explicit) => {
   const dir = explicit || env.CLAUDE_PROJECT_DIR || process.cwd()
   // native: the folder's real letter case on macOS, so /users/x and /Users/x compare equal
@@ -937,6 +977,16 @@ const plain = (text) => String(text).replace(/[\u0000-\u001f\u007f`*_#<>\[\]]/g,
 // Outside the agent's project folder there is no key to send. Saying so gets a placeholder server
 // with one tool that explains it, instead of a 401 that makes Claude offer to sign in from here.
 export const NOT_SET_UP_HEADER = 'X-Msg-Nexus-Folder'
+// A key goes only to its own server: Claude Code tells the helper which server the header is for
+// (CLAUDE_CODE_MCP_SERVER_URL). Without that, or for any other server, no key.
+export const authHeaderFor = (profile, serverUrl = env.CLAUDE_CODE_MCP_SERVER_URL) => {
+  if (profile) {
+    let same = false
+    try { same = Boolean(serverUrl) && checkApi(loadProfile(profile).api) === checkApi(serverUrl) } catch {}
+    if (!same) profile = null
+  }
+  return authHeader(profile)
+}
 const authHeader = (profile) => JSON.stringify(profile
   ? { Authorization: `Bearer ${loadProfile(profile).key}` }
   : { [NOT_SET_UP_HEADER]: 'not-set-up' })
@@ -1218,10 +1268,10 @@ export const newerThan = (a, b) => {
 }
 
 // True when one of SIGNING_KEYS signed this exact text (signature: base64 Ed25519)
-export const signedByMsgNexus = (source, signature, keys = SIGNING_KEYS) => {
+export const signedByMsgNexus = (source, signature) => {
   if (typeof signature !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(signature)) return false
   const spki = Buffer.from('302a300506032b6570032100', 'hex')
-  return keys.some(raw => {
+  return SIGNING_KEYS.some(raw => {
     try {
       return verifySignature(null, Buffer.from(source), createPublicKey({ key: Buffer.concat([spki, Buffer.from(raw, 'base64')]), format: 'der', type: 'spki' }), Buffer.from(signature, 'base64'))
     } catch { return false }
@@ -1358,6 +1408,7 @@ const main = async (argv) => {
   const projectArg = option('project')
   const api = option('api')
   const to = option('to')
+  option('for') // written by 0.5.1's plugin; the server now comes from Claude Code itself
   const handle = option('handle')
   const useChannel = flag('channel')
   const yes = flag('yes')
@@ -1369,7 +1420,17 @@ const main = async (argv) => {
   const scopedProfile = () => explicitProfile ? checkProfileName(explicitProfile) : profileForProject(currentProject(projectArg))
   const needProfile = () => {
     const found = scopedProfile()
-    if (!found) throw new Error(`No msg.nexus agent belongs to ${currentProject(projectArg)}. Run join from the project's folder, or pass --profile.`)
+    if (!found) throw new Error(`No msg.nexus agent belongs to ${currentProject(projectArg)}. Run this from the agent's project folder.`)
+    return found
+  }
+  // The agent of the folder this runs in, and only that one: no --project, and --profile (or
+  // MSG_NEXUS_PROFILE) only when it names that same agent
+  const needInScope = () => {
+    const here = currentProject()
+    const found = profileForProject(here)
+    if (!found || !inScope(found, here) || (explicitProfile && explicitProfile !== found)) {
+      throw new Error(`${explicitProfile ? `The msg.nexus agent "${explicitProfile}"` : 'No msg.nexus agent'} doesn't belong to ${here}. Run this from the agent's project folder.`)
+    }
     return found
   }
   const profile = checkProfileName(explicitProfile ?? 'default')
@@ -1381,7 +1442,11 @@ const main = async (argv) => {
     // A new agent is named after its handle unless told otherwise
     case 'join': return print(await join_(checkProfileName(explicitProfile ?? handle ?? 'default'), rest[0], handle, { apiArg: api, force, projectArg }))
     // Outside its project a session gets no key at all: the tools just don't connect there
-    case 'auth-header': { const found = scopedProfile(); return print(authHeader(found && inScope(found) ? found : null)) }
+    case 'auth-header': {
+      const dir = currentProject(projectArg ?? env.CLAUDE_PROJECT_DIR ?? helperSessionFolder() ?? undefined)
+      const found = explicitProfile ? checkProfileName(explicitProfile) : profileForProject(dir)
+      return print(authHeaderFor(found && inScope(found, dir) ? found : null))
+    }
     case 'rotate': { const { expiresAt } = await rotateKey(needProfile()); return print(`New MCP key saved; it expires ${expiresAt}.`) }
     case 'setup': {
       const output = await setup(profile, api)
@@ -1418,11 +1483,12 @@ const main = async (argv) => {
     case 'spool': return spool(profile)
     // Never falls back to another profile: no agent for this folder means the hook says nothing
     case 'hook': { const found = scopedProfile(); return found && inScope(found) ? hook(found, rest[0]) : undefined }
-    case 'send': return print(await send(needProfile(), to))
+    // Only the agent of this folder: no reaching another agent from elsewhere with --profile
+    case 'send': return print(await send(needInScope(), to))
     case 'status': return print(await status())
     case 'update': return print(await update({ yes, apiArg: api }))
-    case 'tools': return print(await listTools(needProfile()))
-    case 'call': return print(await call(needProfile(), rest[0]))
+    case 'tools': return print(await listTools(needInScope()))
+    case 'call': return print(await call(needInScope(), rest[0]))
     // Only this folder's own agent: no --profile, MSG_NEXUS_PROFILE or --project, so a session
     // elsewhere can't pull another agent over to itself
     case 'move': {
